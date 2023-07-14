@@ -254,8 +254,6 @@ def handle_query():
     script = extract_code(script, "python")
     result = execute_code_with_output(script)
 
-    time.sleep(10)
-
     return construct_response(result, 200)
 
 @app.route("/")
