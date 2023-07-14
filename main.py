@@ -1,4 +1,5 @@
 import os
+import base64
 
 from flask import Flask, request, render_template
 from flask_cors import CORS
@@ -82,7 +83,10 @@ def queryResponseToDataFrame(sqlQuery):
     reqBody = {
         "queryText": applyBigQueryProjectIdHack(sqlQuery)
     }
-    resp = requests.post(QUERY_URL + "query", json=reqBody).json()
+    try:
+        resp = requests.post(QUERY_URL + "query", json=reqBody).json()
+    except Exception as e: 
+        print(e)
     cols = [col["name"] for col in resp["columns"]]
     rows = resp["rows"]
     return pd.DataFrame(rows, columns=cols).to_json()
@@ -122,7 +126,7 @@ def get_sql_from_schema(query, schema):
         input_variables=["query", "schema"],
         template="""
         Objective:
-        - If this query requires us to look at a dataset, generate SQL to fetch the data. Please wrap the SQL query with ```sql, and ```
+        - If this query requires us to look at a dataset, generate SQL (Google dialect) to fetch the data. Please wrap the SQL query with ```sql, and ```
         - If this query does not require any further information, output FALSE (all caps)
 
         Detail: You must provide the table name in format <dataset>.<tablename>
@@ -149,6 +153,11 @@ def get_python_from_schema_and_data(query, schema, table_data):
         Task: We want to generate Python code to answer the following query
         Query: {query}
 
+        Please follow these rules:
+        - If the query has asked to generate a plot, the code should output the file to /tmp/out.png
+        - Otherwise, print() the answer to STDOUT.
+        - Please wrap the code with ```python, and ```
+
         Information we have:
 
         Schema:
@@ -156,9 +165,6 @@ def get_python_from_schema_and_data(query, schema, table_data):
 
         Query results as data frame:
         {table_data}
-
-        Write a Python script that, when executed, prints the answer to the query to stdout.
-        Please wrap the code with ```python, and ```
 
         Python code:
         """,
@@ -193,11 +199,27 @@ def execute_code_with_output(code_string):
 
 #--------------------------------------------------------------------------------------------------------
 
-def construct_response(msg, status):
-    return {
-        'data': msg,
-        'status': status
+def construct_response(data, status):
+    response = {
+        'data': data,
+        'status': status,
+        "is_image": False,
     }
+    
+    file_path = "/tmp/out.png"    
+    if os.path.exists(file_path):
+        with open(file_path, "rb") as file:
+            base64_data = base64.b64encode(file.read()).decode("utf-8")
+            response["data"] = base64_data
+            response["is_image"] = True
+
+    # we'd be doing this in a more sandboxed envrionemtn in the future
+    try:
+        os.remove(file_path)
+    except:
+        print("no file to remove. continuing")         
+
+    return response
 
 @app.route("/api/query")
 def handle_query():
@@ -221,13 +243,12 @@ def handle_query():
         print(f"Plan: about to execute:")
         print(sql)
         table_data = queryResponseToDataFrame(sql)
+        print(table_data)
 
         # then we can ask a question about it. Maybe the query itself was enough, in
         # which case the python program will be trivial
         script = get_python_from_schema_and_data(query, schema, table_data)
         script = extract_code(script, "python")
-        print(f"Plan: about to execute:")
-        print(script)
         result = execute_code_with_output(script)
 
         return construct_response(result, 200)
