@@ -22,6 +22,8 @@ import requests
 import pandas as pd
 import os
 import re
+import json
+import time
 
 app = Flask(__name__, static_folder='static', template_folder='static')
 CORS(app)
@@ -83,13 +85,12 @@ def queryResponseToDataFrame(sqlQuery):
     reqBody = {
         "queryText": applyBigQueryProjectIdHack(sqlQuery)
     }
-    try:
-        resp = requests.post(QUERY_URL + "query", json=reqBody).json()
-    except Exception as e: 
-        print(e)
+    reqBody = json.loads(json.dumps(reqBody))
+    resp = requests.post(QUERY_URL + "query", json=reqBody)
+    resp = resp.json()
     cols = [col["name"] for col in resp["columns"]]
     rows = resp["rows"]
-    return pd.DataFrame(rows, columns=cols).to_json()
+    return pd.DataFrame(rows, columns=cols)
 
 
 def get_embedding_text_from_query(query):
@@ -121,18 +122,20 @@ def get_answer_from_schema(query, schema):
     response = chain.run({ "query": query, "schema": schema })
     return response
 
-def get_sql_from_schema(query, schema):
+def get_sql_from_query_and_schema(query, schema):
     prompt = PromptTemplate(
         input_variables=["query", "schema"],
         template="""
-        Objective:
-        - If this query requires us to look at a dataset, generate SQL (Google dialect) to fetch the data. Please wrap the SQL query with ```sql, and ```
-        - If this query does not require any further information, output FALSE (all caps)
-
-        Detail: You must provide the table name in format <dataset>.<tablename>
+        Task: We want to answer the user's query by generating a BigQuery query
 
         Schema information:
         {schema}
+    
+        Details:
+        - wrap the sql code with ```sql and ```, write in a single line
+        - explain what the shape of the dataframe is in a single sentence and wrap with ```explanation and ```
+        - You must provide the table name in format <dataset>.<tablename>
+
 
         Query: {query}
         Answer:
@@ -146,33 +149,26 @@ def get_sql_from_schema(query, schema):
     """)
     return response
 
-def get_python_from_schema_and_data(query, schema, table_data):
+def get_python_from_schema_and_data(query, schema, sql_explanation):
     prompt = PromptTemplate(
-        input_variables=["query", "schema", "table_data"],
+        input_variables=["query", "sql_explanation"],
         template="""
-        Task: We want to generate Python code to answer the following query
+        Task: We want to generate Python code to answer the following query. Please wrap the code with ```python
+        
         Query: {query}
+        Dataframe: {sql_explanation}. It can be loaded from /tmp/dataframe.json.
 
         Please follow these rules:
-        - If the query has asked to generate a plot, the code should output the file to /tmp/out.png
-        - Otherwise, print() the answer to STDOUT.
-        - Please wrap the code with ```python, and ```
-
-        Information we have:
-
-        Schema:
-        {schema}
-
-        Query results as data frame:
-        {table_data}
+        - If the dataframe represents what the query is asking for, just print the query results to stdout
+        - If the query has asked to generate a plot, the code should output the file to /tmp/out.png. DO NOT call plt.show()
+        - Otherwise, determine how to find the answer and print to stdout.
 
         Python code:
         """,
     )
     chain = LLMChain(llm=llm, prompt=prompt)
-    response = chain.run({ "query": query, "schema": schema, "table_data": table_data })
+    response = chain.run({ "query": query, "sql_explanation": sql_explanation })
     return response
-
 
 def extract_code(input_string, lang):
     pattern = r"```LANG\n([\s\S]+?)\n```"
@@ -190,6 +186,12 @@ def execute_code_with_output(code_string):
                                stderr=subprocess.PIPE,
                                universal_newlines=True)
     
+    # we'd be doing this in a more sandboxed envrionemtn in the future
+    try:
+        os.remove("/tmp/out.png")
+    except:
+        print("no file to remove. continuing")       
+    
     # Capture the stdout and stderr
     stdout, stderr = process.communicate()
     
@@ -206,7 +208,7 @@ def construct_response(data, status):
         "is_image": False,
     }
     
-    file_path = "/tmp/out.png"    
+    file_path = "/tmp/out.png"
     if os.path.exists(file_path):
         with open(file_path, "rb") as file:
             base64_data = base64.b64encode(file.read()).decode("utf-8")
@@ -224,36 +226,37 @@ def construct_response(data, status):
 @app.route("/api/query")
 def handle_query():
     query = request.args.get('q')
-    print(f"Observation: Got query: {query}")
-    
     schema = get_embedding_text_from_query(query)
-    print(f"Observation: Found this schema: {schema}")
 
     # we can answer without seeing anything besides the schema
     a = get_answer_from_schema(query, schema)
-    print(f"Thought: Can we answer the question? {a}")
     if a != "FALSE":
         return construct_response(a, 200)
 
-    # we need data, and maybe more things
-    sql = get_sql_from_schema(query, schema)
-    if sql != "FALSE":
-        # first, fetch the data
-        sql = extract_code(sql, "sql")
-        print(f"Plan: about to execute:")
-        print(sql)
-        table_data = queryResponseToDataFrame(sql)
-        print(table_data)
-
-        # then we can ask a question about it. Maybe the query itself was enough, in
-        # which case the python program will be trivial
-        script = get_python_from_schema_and_data(query, schema, table_data)
-        script = extract_code(script, "python")
-        result = execute_code_with_output(script)
-
-        return construct_response(result, 200)
+    # since we can't answer, generate SQL and explain the SQL
+    sql_out_orig = get_sql_from_query_and_schema(query, schema)
+    sql = extract_code(sql_out_orig, "sql")
+    sql_explanation = extract_code(sql_out_orig, "explanation")
     
-    return construct_response("I could not determine the answer to your question!", 200)
+    # now run the SQL and save the dataframe
+    table_data = queryResponseToDataFrame(sql)
+    print(table_data)
+    table_data.to_json('/tmp/dataframe.json', orient='records')
+
+    # then we can ask a question about it. Maybe the query itself was enough, in
+    # which case the python program will be trivial
+    script = get_python_from_schema_and_data(query, schema, sql_explanation)
+    print(f"""
+    Thought: got this python script
+    ------------------------------
+    {script}
+    """)        
+    script = extract_code(script, "python")
+    result = execute_code_with_output(script)
+
+    time.sleep(10)
+
+    return construct_response(result, 200)
 
 @app.route("/")
 def hello_world():
